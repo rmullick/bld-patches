@@ -1,6 +1,27 @@
-BLD-3.17 for Linux-3.17, this contains a build fix when
-CONFIG_BLD=n. Actually, when bld patch is applied I hardly
-try with CONFIG_BLD=n, so it was unnoticed so far.
+BLD patch for Linux 3.17, contains a build fix when CONFIG_BLD=n.
+Below shows a stat of default netperf run on localhost system
+(client/server) running on local system (core i3, 2g ram).
+
+	    tcp_stream	tcp_rr    udp_stream     udp_rr
+
+mainline    9343.54    20812.03	   18231.74	24396.074
+				   18210.71
+
+bld	   14738.35    29224.54    26475.75	34910.08
+				   26462.53
+
+These are average of 5 runs of each tests. BLD performs better
+and shows ~(35-40)% improvement. And, recently Luis Cruz backports
+BLD's previous release BLD-3.16 for Android and experimentally
+ran it on his galaxy SIII, these could be found at following link:
+
+https://github.com/SyNtheticNightmar3/bld-patches
+
+If you are interested in running it on Android, take a look at the
+above link.
+
+Thanks,
+Rakib
 
 Signed-off-by: Rakib Mullick <rakib.mullick@gmail.com>
 ---
