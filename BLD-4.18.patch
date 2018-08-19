@@ -1,0 +1,980 @@
+diff --git a/init/Kconfig b/init/Kconfig
+index 041f3a022122..3213e61dd824 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -53,6 +53,15 @@ config BROKEN_ON_SMP
+ 	depends on BROKEN || !SMP
+ 	default y
+ 
++config BLD
++	bool "An alternate CPU load distribution technique for task scheduler"
++	depends on SMP && !NUMA_BALANCING && !SCHED_SMT
++	default y
++	help
++	  This is an alternate CPU load distribution technique based for task
++	  scheduler based on The Barbershop Load Distribution algorithm. Not
++	  suitable for NUMA, should work well on SMP.
++
+ config INIT_ENV_ARG_LIMIT
+ 	int
+ 	default 32 if !UML
+diff --git a/kernel/sched/bld.h b/kernel/sched/bld.h
+new file mode 100644
+index 000000000000..e2a487db1f9f
+--- /dev/null
++++ b/kernel/sched/bld.h
+@@ -0,0 +1,215 @@
++#ifdef CONFIG_BLD
++
++static DEFINE_RWLOCK(rt_list_lock);
++static LIST_HEAD(rt_rq_head);
++static LIST_HEAD(cfs_rq_head);
++static DEFINE_RWLOCK(cfs_list_lock);
++
++#ifdef CONFIG_FAIR_GROUP_SCHED
++static inline struct rq *rq_of_cfs(struct cfs_rq *cfs_rq)
++{
++	return cfs_rq->rq;
++}
++#else
++static inline struct rq *rq_of_cfs(struct cfs_rq *cfs_rq)
++{
++	return container_of(cfs_rq, struct rq, cfs);
++}
++#endif
++
++#ifdef CONFIG_RT_GROUP_SCHED
++static inline struct rq *rq_of_rt(struct rt_rq *rt_rq)
++{
++	return rt_rq->rq;
++}
++#else
++static inline struct rq *rq_of_rt(struct rt_rq *rt_rq)
++{
++	return container_of(rt_rq, struct rq, rt);
++}
++#endif
++
++static int select_cpu_for_wakeup(int task_type, struct cpumask *mask)
++{
++	int cpu = smp_processor_id(), i;
++	unsigned long load, varload;
++	struct rq *rq;
++
++	if (task_type) {
++		varload = ULONG_MAX;
++		for_each_cpu(i, mask) {
++			rq = cpu_rq(i);
++			load = rq->cfs.load.weight;
++			if (load < varload) {
++				varload = load;
++				cpu = i;
++			}
++		}
++	} else {
++		/* Here's an attempt to get a CPU within the mask where
++		 * we can preempt easily. To achieve this we tried to
++		 * maintain a lowbit, which indicate the lowest bit set on
++		 * array bitmap. Since all CPUs contains high priority
++		 * kernel threads therefore we eliminate 0, so it might not
++		 * be right every time, but it's just an indicator.
++		 */
++		varload = 1;
++
++		for_each_cpu(i, mask) {
++			rq = cpu_rq(i);
++			load = rq->rt.lowbit;
++			if (load >= varload) {
++				varload = load;
++				cpu = i;
++			}
++		}
++	}
++
++	return cpu;
++}
++
++static int bld_pick_cpu_cfs(struct task_struct *p, int sd_flags, int wake_flags)
++{
++	struct cfs_rq *cfs;
++	unsigned long flags;
++	unsigned int cpu = smp_processor_id();
++
++	read_lock_irqsave(&cfs_list_lock, flags);
++	list_for_each_entry(cfs, &cfs_rq_head, bld_cfs_list) {
++		cpu = cpu_of(rq_of_cfs(cfs));
++		if (cpu_online(cpu))
++			break;
++	}
++	read_unlock_irqrestore(&cfs_list_lock, flags);
++	return cpu;
++}
++
++static int bld_pick_cpu_rt(struct task_struct *p, int sd_flags, int wake_flags)
++{
++	struct rt_rq *rt;
++	unsigned long flags;
++	unsigned int cpu = smp_processor_id();
++
++	read_lock_irqsave(&rt_list_lock, flags);
++	list_for_each_entry(rt, &rt_rq_head, bld_rt_list) {
++		cpu = cpu_of(rq_of_rt(rt));
++		if (cpu_online(cpu))
++			break;
++	}
++	read_unlock_irqrestore(&rt_list_lock, flags);
++	return cpu;
++}
++
++static int bld_pick_cpu_domain(struct task_struct *p, int sd_flags, int wake_flags)
++{
++	unsigned int cpu = smp_processor_id(), want_affine = 0;
++	struct cpumask *tmpmask;
++
++	if (p->nr_cpus_allowed == 1)
++		return task_cpu(p);
++
++	if (sd_flags & SD_BALANCE_WAKE) {
++		if (cpumask_test_cpu(cpu, &p->cpus_allowed)) {
++			want_affine = 1;
++		}
++	}
++
++	if (want_affine)
++		tmpmask = &p->cpus_allowed;
++	else
++		tmpmask = sched_domain_span(cpu_rq(task_cpu(p))->sd);
++
++	if (rt_task(p))
++		cpu = select_cpu_for_wakeup(0, tmpmask);
++	else
++		cpu = select_cpu_for_wakeup(1, tmpmask);
++
++	return cpu;
++}
++
++static void track_load_rt(struct rq *rq, struct task_struct *p)
++{
++	unsigned long flag;
++	int firstbit;
++	struct rt_rq *first;
++	struct rt_prio_array *array = &rq->rt.active;
++
++	first = list_entry(rt_rq_head.next, struct rt_rq, bld_rt_list);
++	firstbit = sched_find_first_bit(array->bitmap);
++
++	/* Maintaining rt.lowbit */
++	if (firstbit > 0 && firstbit <= rq->rt.lowbit)
++		rq->rt.lowbit = firstbit;
++
++	if (rq->rt.lowbit < first->lowbit) {
++		write_lock_irqsave(&rt_list_lock, flag);
++		list_del(&rq->rt.bld_rt_list);
++		list_add_tail(&rq->rt.bld_rt_list, &rt_rq_head);
++		write_unlock_irqrestore(&rt_list_lock, flag);
++	}
++}
++
++static int bld_get_cpu(struct task_struct *p, int sd_flags, int wake_flags)
++{
++	unsigned int cpu;
++
++	if (sd_flags == SD_BALANCE_WAKE || (sd_flags == SD_BALANCE_EXEC && (get_nr_threads(p) > 1)))
++		cpu = bld_pick_cpu_domain(p, sd_flags, wake_flags);
++	else {
++		if (rt_task(p))
++			cpu = bld_pick_cpu_rt(p, sd_flags, wake_flags);
++		else
++			cpu = bld_pick_cpu_cfs(p, sd_flags, wake_flags);
++	}
++
++	return cpu;
++}
++
++static void bld_track_load_activate(struct rq *rq, struct task_struct *p)
++{
++	unsigned long flag;
++	if (rt_task(p)) {
++		track_load_rt(rq, p);
++	} else {
++		if (rq->cfs.pos != 2) {
++			struct cfs_rq *last;
++			last = list_entry(cfs_rq_head.prev, struct cfs_rq, bld_cfs_list);
++			if (rq->cfs.load.weight >= last->load.weight) {
++				write_lock_irqsave(&cfs_list_lock, flag);
++				list_del(&rq->cfs.bld_cfs_list);
++				list_add_tail(&rq->cfs.bld_cfs_list, &cfs_rq_head);
++				rq->cfs.pos = 2; last->pos = 1;
++				write_unlock_irqrestore(&cfs_list_lock, flag);
++			}
++		}
++	}
++}
++
++static void bld_track_load_deactivate(struct rq *rq, struct task_struct *p)
++{
++	unsigned long flag;
++	if (rt_task(p)) {
++		track_load_rt(rq, p);
++	} else {
++		if (rq->cfs.pos != 0) {
++			struct cfs_rq *first;
++			first = list_entry(cfs_rq_head.next, struct cfs_rq, bld_cfs_list);
++			if (rq->cfs.load.weight <= first->load.weight) {
++				write_lock_irqsave(&cfs_list_lock, flag);
++				list_del(&rq->cfs.bld_cfs_list);
++				list_add(&rq->cfs.bld_cfs_list, &cfs_rq_head);
++				rq->cfs.pos = 0; first->pos = 1;
++				write_unlock_irqrestore(&cfs_list_lock, flag);
++			}
++		}
++	}
++}
++#else
++static inline void bld_track_load_activate(struct rq *rq, struct task_struct *p)
++{
++}
++
++static inline void bld_track_load_deactivate(struct rq *rq, struct task_struct *p)
++{
++}
++#endif /* CONFIG_BLD */
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index fe365c9a08e9..aa564616ef15 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -16,6 +16,7 @@
+ 
+ #include "../workqueue_internal.h"
+ #include "../smpboot.h"
++#include "bld.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+@@ -748,6 +749,8 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ 		sched_info_queued(rq, p);
+ 
+ 	p->sched_class->enqueue_task(rq, p, flags);
++	if (!dl_task(p))
++		bld_track_load_activate(rq, p);
+ }
+ 
+ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+@@ -759,6 +762,8 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+ 		sched_info_dequeued(rq, p);
+ 
+ 	p->sched_class->dequeue_task(rq, p, flags);
++	if (!dl_task(p))
++		bld_track_load_deactivate(rq, p);
+ }
+ 
+ void activate_task(struct rq *rq, struct task_struct *p, int flags)
+@@ -1547,11 +1552,17 @@ int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags)
+ {
+ 	lockdep_assert_held(&p->pi_lock);
+ 
++#ifndef	CONFIG_BLD
+ 	if (p->nr_cpus_allowed > 1)
+ 		cpu = p->sched_class->select_task_rq(p, cpu, sd_flags, wake_flags);
+ 	else
+ 		cpu = cpumask_any(&p->cpus_allowed);
+-
++#else
++	if (dl_task(p))
++		cpu = dl_sched_class.select_task_rq(p, cpu, sd_flags, wake_flags);
++	else
++		cpu = bld_get_cpu(p, sd_flags, wake_flags);
++#endif
+ 	/*
+ 	 * In order not to call set_task_cpu() on a blocking task we need
+ 	 * to rely on ttwu() to place the task on a valid ->cpus_allowed
+@@ -1771,7 +1782,11 @@ void scheduler_ipi(void)
+ 	 */
+ 	preempt_fold_need_resched();
+ 
++#ifndef	CONFIG_BLD
+ 	if (llist_empty(&this_rq()->wake_list) && !got_nohz_idle_kick())
++#else
++	if (llist_empty(&this_rq()->wake_list))
++#endif
+ 		return;
+ 
+ 	/*
+@@ -1793,13 +1808,16 @@ void scheduler_ipi(void)
+ 	/*
+ 	 * Check if someone kicked us for doing the nohz idle load balance.
+ 	 */
++#ifndef	CONFIG_BLD
+ 	if (unlikely(got_nohz_idle_kick())) {
+ 		this_rq()->idle_balance = 1;
+ 		raise_softirq_irqoff(SCHED_SOFTIRQ);
+ 	}
++#endif
+ 	irq_exit();
+ }
+ 
++#ifndef	CONFIG_BLD
+ static void ttwu_queue_remote(struct task_struct *p, int cpu, int wake_flags)
+ {
+ 	struct rq *rq = cpu_rq(cpu);
+@@ -1813,6 +1831,7 @@ static void ttwu_queue_remote(struct task_struct *p, int cpu, int wake_flags)
+ 			trace_sched_wake_idle_without_ipi(cpu);
+ 	}
+ }
++#endif	/*CONFIG_BLD */
+ 
+ void wake_up_if_idle(int cpu)
+ {
+@@ -1849,7 +1868,7 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+ 	struct rq *rq = cpu_rq(cpu);
+ 	struct rq_flags rf;
+ 
+-#if defined(CONFIG_SMP)
++#if defined(CONFIG_SMP) && !defined(CONFIG_BLD)
+ 	if (sched_feat(TTWU_QUEUE) && !cpus_share_cache(smp_processor_id(), cpu)) {
+ 		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+ 		ttwu_queue_remote(p, cpu, wake_flags);
+@@ -2975,7 +2994,14 @@ void sched_exec(void)
+ 	int dest_cpu;
+ 
+ 	raw_spin_lock_irqsave(&p->pi_lock, flags);
++#ifndef	CONFIG_BLD
+ 	dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), SD_BALANCE_EXEC, 0);
++#else
++	if (dl_task(p))
++		dest_cpu = task_cpu(p);
++	else
++		dest_cpu = bld_get_cpu(p, SD_BALANCE_EXEC, 0);
++#endif
+ 	if (dest_cpu == smp_processor_id())
+ 		goto unlock;
+ 
+@@ -3085,8 +3111,10 @@ void scheduler_tick(void)
+ 
+ #ifdef CONFIG_SMP
+ 	rq->idle_balance = idle_cpu(cpu);
++#ifndef	CONFIG_BLD
+ 	trigger_load_balance(rq);
+ #endif
++#endif
+ }
+ 
+ #ifdef CONFIG_NO_HZ_FULL
+@@ -5865,7 +5893,9 @@ int sched_cpu_dying(unsigned int cpu)
+ 
+ 	calc_load_migrate(rq);
+ 	update_max_interval();
++#ifndef	CONFIG_BLD
+ 	nohz_balance_exit_idle(rq);
++#endif
+ 	hrtick_clear(rq);
+ 	return 0;
+ }
+@@ -6084,6 +6114,15 @@ void __init sched_init(void)
+ #endif /* CONFIG_SMP */
+ 		hrtick_rq_init(rq);
+ 		atomic_set(&rq->nr_iowait, 0);
++#ifdef CONFIG_BLD
++		INIT_LIST_HEAD(&rq->cfs.bld_cfs_list);
++		list_add_tail(&rq->cfs.bld_cfs_list, &cfs_rq_head);
++		rq->cfs.pos = 0;
++
++		INIT_LIST_HEAD(&rq->rt.bld_rt_list);
++		list_add_tail(&rq->rt.bld_rt_list, &rt_rq_head);
++		rq->rt.lowbit = INT_MAX;
++#endif 
+ 	}
+ 
+ 	set_load_weight(&init_task, false);
+@@ -6113,6 +6152,9 @@ void __init sched_init(void)
+ 	init_schedstats();
+ 
+ 	scheduler_running = 1;
++#ifdef	CONFIG_BLD
++	printk(KERN_INFO "BLD: An Alternate CPU load distributor activated.\n");
++#endif 
+ }
+ 
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 2f0a0be4d344..27255340267f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -136,6 +136,11 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
+ 	lw->inv_weight = 0;
+ }
+ 
++static unsigned long capacity_of(int cpu)
++{
++	return cpu_rq(cpu)->cpu_capacity;
++}
++
+ /*
+  * Increase the granularity value when there are more CPUs,
+  * because with more CPUs the 'effective latency' as visible
+@@ -695,7 +700,9 @@ static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 
+ #include "sched-pelt.h"
+ 
++#ifndef CONFIG_BLD
+ static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
++#endif
+ static unsigned long task_h_load(struct task_struct *p);
+ 
+ /* Give new sched_entity start runnable values to heavy its load in infant time */
+@@ -1448,7 +1455,6 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
+ static unsigned long weighted_cpuload(struct rq *rq);
+ static unsigned long source_load(int cpu, int type);
+ static unsigned long target_load(int cpu, int type);
+-static unsigned long capacity_of(int cpu);
+ 
+ /* Cached statistics for all CPUs within a node */
+ struct numa_stats {
+@@ -5568,6 +5574,26 @@ decay_load_missed(unsigned long load, unsigned long missed_updates, int idx)
+ 	}
+ 	return load;
+ }
++#endif /* CONFIG_NO_HZ_COMMON */
++
++#ifndef	CONFIG_BLD
++static void set_cpu_sd_state_busy(int cpu)
++{
++	struct sched_domain *sd;
++
++	rcu_read_lock();
++	sd = rcu_dereference(per_cpu(sd_llc, cpu));
++
++	if (!sd || !sd->nohz_idle)
++		goto unlock;
++	sd->nohz_idle = 0;
++
++	atomic_inc(&sd->shared->nr_busy_cpus);
++unlock:
++	rcu_read_unlock();
++}
++
++static DEFINE_SPINLOCK(balancing);
+ 
+ static struct {
+ 	cpumask_var_t idle_cpus_mask;
+@@ -5577,7 +5603,20 @@ static struct {
+ 	unsigned long next_blocked;	/* Next update of blocked load in jiffies */
+ } nohz ____cacheline_aligned;
+ 
+-#endif /* CONFIG_NO_HZ_COMMON */
++void nohz_balance_exit_idle(struct rq *rq)
++{
++	SCHED_WARN_ON(rq != this_rq());
++
++	if (likely(!rq->nohz_tick_stopped))
++		return;
++
++	rq->nohz_tick_stopped = 0;
++	cpumask_clear_cpu(rq->cpu, nohz.idle_cpus_mask);
++	atomic_dec(&nohz.nr_cpus);
++
++	set_cpu_sd_state_busy(rq->cpu);
++}
++#endif /* CONFIG_BLD */
+ 
+ /**
+  * __cpu_load_update - update the rq->cpu_load[] statistics
+@@ -5776,6 +5815,7 @@ void cpu_load_update_active(struct rq *this_rq)
+ 		cpu_load_update_periodic(this_rq, load);
+ }
+ 
++#ifndef	CONFIG_BLD
+ /*
+  * Return a low guess at the load of a migration-source CPU weighted
+  * according to the scheduling class and "nice" value.
+@@ -5809,11 +5849,6 @@ static unsigned long target_load(int cpu, int type)
+ 	return max(rq->cpu_load[type-1], total);
+ }
+ 
+-static unsigned long capacity_of(int cpu)
+-{
+-	return cpu_rq(cpu)->cpu_capacity;
+-}
+-
+ static unsigned long capacity_orig_of(int cpu)
+ {
+ 	return cpu_rq(cpu)->cpu_capacity_orig;
+@@ -6663,6 +6698,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
+ 
+ 	return new_cpu;
+ }
++#endif /* CONFIG_BLD */
+ 
+ static void detach_entity_cfs_rq(struct sched_entity *se);
+ 
+@@ -7014,6 +7050,7 @@ done: __maybe_unused;
+ 	return p;
+ 
+ idle:
++#ifndef	CONFIG_BLD
+ 	new_tasks = idle_balance(rq, rf);
+ 
+ 	/*
+@@ -7026,7 +7063,7 @@ done: __maybe_unused;
+ 
+ 	if (new_tasks > 0)
+ 		goto again;
+-
++#endif	/* CONFIG_BLD */
+ 	return NULL;
+ }
+ 
+@@ -7758,101 +7795,6 @@ static unsigned long task_h_load(struct task_struct *p)
+ }
+ #endif
+ 
+-/********** Helpers for find_busiest_group ************************/
+-
+-enum group_type {
+-	group_other = 0,
+-	group_imbalanced,
+-	group_overloaded,
+-};
+-
+-/*
+- * sg_lb_stats - stats of a sched_group required for load_balancing
+- */
+-struct sg_lb_stats {
+-	unsigned long avg_load; /*Avg load across the CPUs of the group */
+-	unsigned long group_load; /* Total load over the CPUs of the group */
+-	unsigned long sum_weighted_load; /* Weighted load of group's tasks */
+-	unsigned long load_per_task;
+-	unsigned long group_capacity;
+-	unsigned long group_util; /* Total utilization of the group */
+-	unsigned int sum_nr_running; /* Nr tasks running in the group */
+-	unsigned int idle_cpus;
+-	unsigned int group_weight;
+-	enum group_type group_type;
+-	int group_no_capacity;
+-#ifdef CONFIG_NUMA_BALANCING
+-	unsigned int nr_numa_running;
+-	unsigned int nr_preferred_running;
+-#endif
+-};
+-
+-/*
+- * sd_lb_stats - Structure to store the statistics of a sched_domain
+- *		 during load balancing.
+- */
+-struct sd_lb_stats {
+-	struct sched_group *busiest;	/* Busiest group in this sd */
+-	struct sched_group *local;	/* Local group in this sd */
+-	unsigned long total_running;
+-	unsigned long total_load;	/* Total load of all groups in sd */
+-	unsigned long total_capacity;	/* Total capacity of all groups in sd */
+-	unsigned long avg_load;	/* Average load across all groups in sd */
+-
+-	struct sg_lb_stats busiest_stat;/* Statistics of the busiest group */
+-	struct sg_lb_stats local_stat;	/* Statistics of the local group */
+-};
+-
+-static inline void init_sd_lb_stats(struct sd_lb_stats *sds)
+-{
+-	/*
+-	 * Skimp on the clearing to avoid duplicate work. We can avoid clearing
+-	 * local_stat because update_sg_lb_stats() does a full clear/assignment.
+-	 * We must however clear busiest_stat::avg_load because
+-	 * update_sd_pick_busiest() reads this before assignment.
+-	 */
+-	*sds = (struct sd_lb_stats){
+-		.busiest = NULL,
+-		.local = NULL,
+-		.total_running = 0UL,
+-		.total_load = 0UL,
+-		.total_capacity = 0UL,
+-		.busiest_stat = {
+-			.avg_load = 0UL,
+-			.sum_nr_running = 0,
+-			.group_type = group_other,
+-		},
+-	};
+-}
+-
+-/**
+- * get_sd_load_idx - Obtain the load index for a given sched domain.
+- * @sd: The sched_domain whose load_idx is to be obtained.
+- * @idle: The idle status of the CPU for whose sd load_idx is obtained.
+- *
+- * Return: The load index.
+- */
+-static inline int get_sd_load_idx(struct sched_domain *sd,
+-					enum cpu_idle_type idle)
+-{
+-	int load_idx;
+-
+-	switch (idle) {
+-	case CPU_NOT_IDLE:
+-		load_idx = sd->busy_idx;
+-		break;
+-
+-	case CPU_NEWLY_IDLE:
+-		load_idx = sd->newidle_idx;
+-		break;
+-	default:
+-		load_idx = sd->idle_idx;
+-		break;
+-	}
+-
+-	return load_idx;
+-}
+-
+ static unsigned long scale_rt_capacity(int cpu)
+ {
+ 	struct rq *rq = cpu_rq(cpu);
+@@ -7967,6 +7909,101 @@ void update_group_capacity(struct sched_domain *sd, int cpu)
+ 	sdg->sgc->min_capacity = min_capacity;
+ }
+ 
++#ifndef	CONFIG_BLD
++/********** Helpers for find_busiest_group ************************/
++enum group_type {
++	group_other = 0,
++	group_imbalanced,
++	group_overloaded,
++};
++
++/*
++ * sg_lb_stats - stats of a sched_group required for load_balancing
++ */
++struct sg_lb_stats {
++	unsigned long avg_load; /*Avg load across the CPUs of the group */
++	unsigned long group_load; /* Total load over the CPUs of the group */
++	unsigned long sum_weighted_load; /* Weighted load of group's tasks */
++	unsigned long load_per_task;
++	unsigned long group_capacity;
++	unsigned long group_util; /* Total utilization of the group */
++	unsigned int sum_nr_running; /* Nr tasks running in the group */
++	unsigned int idle_cpus;
++	unsigned int group_weight;
++	enum group_type group_type;
++	int group_no_capacity;
++#ifdef CONFIG_NUMA_BALANCING
++	unsigned int nr_numa_running;
++	unsigned int nr_preferred_running;
++#endif
++};
++
++/*
++ * sd_lb_stats - Structure to store the statistics of a sched_domain
++ *		 during load balancing.
++ */
++struct sd_lb_stats {
++	struct sched_group *busiest;	/* Busiest group in this sd */
++	struct sched_group *local;	/* Local group in this sd */
++	unsigned long total_running;
++	unsigned long total_load;	/* Total load of all groups in sd */
++	unsigned long total_capacity;	/* Total capacity of all groups in sd */
++	unsigned long avg_load;	/* Average load across all groups in sd */
++
++	struct sg_lb_stats busiest_stat;/* Statistics of the busiest group */
++	struct sg_lb_stats local_stat;	/* Statistics of the local group */
++};
++
++static inline void init_sd_lb_stats(struct sd_lb_stats *sds)
++{
++	/*
++	 * Skimp on the clearing to avoid duplicate work. We can avoid clearing
++	 * local_stat because update_sg_lb_stats() does a full clear/assignment.
++	 * We must however clear busiest_stat::avg_load because
++	 * update_sd_pick_busiest() reads this before assignment.
++	 */
++	*sds = (struct sd_lb_stats){
++		.busiest = NULL,
++		.local = NULL,
++		.total_running = 0UL,
++		.total_load = 0UL,
++		.total_capacity = 0UL,
++		.busiest_stat = {
++			.avg_load = 0UL,
++			.sum_nr_running = 0,
++			.group_type = group_other,
++		},
++	};
++}
++
++/**
++ * get_sd_load_idx - Obtain the load index for a given sched domain.
++ * @sd: The sched_domain whose load_idx is to be obtained.
++ * @idle: The idle status of the CPU for whose sd load_idx is obtained.
++ *
++ * Return: The load index.
++ */
++static inline int get_sd_load_idx(struct sched_domain *sd,
++					enum cpu_idle_type idle)
++{
++	int load_idx;
++
++	switch (idle) {
++	case CPU_NOT_IDLE:
++		load_idx = sd->busy_idx;
++		break;
++
++	case CPU_NEWLY_IDLE:
++		load_idx = sd->newidle_idx;
++		break;
++	default:
++		load_idx = sd->idle_idx;
++		break;
++	}
++
++	return load_idx;
++}
++
+ /*
+  * Check whether the capacity of the rq has been noticeably reduced by side
+  * activity. The imbalance_pct is used for the threshold.
+@@ -9192,17 +9229,6 @@ static int active_load_balance_cpu_stop(void *data)
+ 	return 0;
+ }
+ 
+-static DEFINE_SPINLOCK(balancing);
+-
+-/*
+- * Scale the max load_balance interval with the number of CPUs in the system.
+- * This trades load-balance latency on larger machines for less cross talk.
+- */
+-void update_max_interval(void)
+-{
+-	max_load_balance_interval = HZ*num_online_cpus()/10;
+-}
+-
+ /*
+  * It checks each scheduling domain to see if it is due to be balanced,
+  * and initiates a balancing operation if so.
+@@ -9309,12 +9335,23 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
+ #endif
+ 	}
+ }
++#endif /* CONFIG_BLD */
++
++/*
++ * Scale the max load_balance interval with the number of CPUs in the system.
++ * This trades load-balance latency on larger machines for less cross talk.
++ */
++void update_max_interval(void)
++{
++	max_load_balance_interval = HZ*num_online_cpus()/10;
++}
+ 
+ static inline int on_null_domain(struct rq *rq)
+ {
+ 	return unlikely(!rcu_dereference_sched(rq->sd));
+ }
+ 
++#ifndef	CONFIG_BLD
+ #ifdef CONFIG_NO_HZ_COMMON
+ /*
+  * idle load balancing details
+@@ -9453,36 +9490,6 @@ static void nohz_balancer_kick(struct rq *rq)
+ 		kick_ilb(flags);
+ }
+ 
+-static void set_cpu_sd_state_busy(int cpu)
+-{
+-	struct sched_domain *sd;
+-
+-	rcu_read_lock();
+-	sd = rcu_dereference(per_cpu(sd_llc, cpu));
+-
+-	if (!sd || !sd->nohz_idle)
+-		goto unlock;
+-	sd->nohz_idle = 0;
+-
+-	atomic_inc(&sd->shared->nr_busy_cpus);
+-unlock:
+-	rcu_read_unlock();
+-}
+-
+-void nohz_balance_exit_idle(struct rq *rq)
+-{
+-	SCHED_WARN_ON(rq != this_rq());
+-
+-	if (likely(!rq->nohz_tick_stopped))
+-		return;
+-
+-	rq->nohz_tick_stopped = 0;
+-	cpumask_clear_cpu(rq->cpu, nohz.idle_cpus_mask);
+-	atomic_dec(&nohz.nr_cpus);
+-
+-	set_cpu_sd_state_busy(rq->cpu);
+-}
+-
+ static void set_cpu_sd_state_idle(int cpu)
+ {
+ 	struct sched_domain *sd;
+@@ -9693,7 +9700,6 @@ static bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle)
+ 		return false;
+ 
+ 	_nohz_idle_balance(this_rq, flags, idle);
+-
+ 	return true;
+ }
+ 
+@@ -9856,6 +9862,7 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
+ 
+ 	return pulled_task;
+ }
++#endif	/* CONFIG_BLD */
+ 
+ /*
+  * run_rebalance_domains is triggered when needed from the scheduler tick.
+@@ -9863,6 +9870,7 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
+  */
+ static __latent_entropy void run_rebalance_domains(struct softirq_action *h)
+ {
++#ifndef	CONFIG_BLD
+ 	struct rq *this_rq = this_rq();
+ 	enum cpu_idle_type idle = this_rq->idle_balance ?
+ 						CPU_IDLE : CPU_NOT_IDLE;
+@@ -9881,6 +9889,7 @@ static __latent_entropy void run_rebalance_domains(struct softirq_action *h)
+ 	/* normal load balance */
+ 	update_blocked_averages(this_rq->cpu);
+ 	rebalance_domains(this_rq, idle);
++#endif
+ }
+ 
+ /*
+@@ -9888,6 +9897,7 @@ static __latent_entropy void run_rebalance_domains(struct softirq_action *h)
+  */
+ void trigger_load_balance(struct rq *rq)
+ {
++#ifndef	CONFIG_BLD
+ 	/* Don't need to rebalance while attached to NULL domain */
+ 	if (unlikely(on_null_domain(rq)))
+ 		return;
+@@ -9896,6 +9906,7 @@ void trigger_load_balance(struct rq *rq)
+ 		raise_softirq(SCHED_SOFTIRQ);
+ 
+ 	nohz_balancer_kick(rq);
++#endif
+ }
+ 
+ static void rq_online_fair(struct rq *rq)
+@@ -10408,7 +10419,9 @@ const struct sched_class fair_sched_class = {
+ 	.put_prev_task		= put_prev_task_fair,
+ 
+ #ifdef CONFIG_SMP
++#ifndef	CONFIG_BLD
+ 	.select_task_rq		= select_task_rq_fair,
++#endif
+ 	.migrate_task_rq	= migrate_task_rq_fair,
+ 
+ 	.rq_online		= rq_online_fair,
+@@ -10469,6 +10482,7 @@ void show_numa_stats(struct task_struct *p, struct seq_file *m)
+ 
+ __init void init_sched_fair_class(void)
+ {
++#ifndef	CONFIG_BLD
+ #ifdef CONFIG_SMP
+ 	open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+ 
+@@ -10478,5 +10492,5 @@ __init void init_sched_fair_class(void)
+ 	zalloc_cpumask_var(&nohz.idle_cpus_mask, GFP_NOWAIT);
+ #endif
+ #endif /* SMP */
+-
++#endif /* BLD */
+ }
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index eaaec8364f96..a94e6e1a50d1 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1385,6 +1385,7 @@ static void yield_task_rt(struct rq *rq)
+ #ifdef CONFIG_SMP
+ static int find_lowest_rq(struct task_struct *task);
+ 
++#ifndef	CONFIG_BLD
+ static int
+ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
+ {
+@@ -1440,6 +1441,7 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
+ out:
+ 	return cpu;
+ }
++#endif	/* CONFIG_BLD */
+ 
+ static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
+ {
+@@ -2375,7 +2377,9 @@ const struct sched_class rt_sched_class = {
+ 	.put_prev_task		= put_prev_task_rt,
+ 
+ #ifdef CONFIG_SMP
++#ifndef	CONFIG_BLD
+ 	.select_task_rq		= select_task_rq_rt,
++#endif
+ 
+ 	.set_cpus_allowed       = set_cpus_allowed_common,
+ 	.rq_online              = rq_online_rt,
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c7742dcc136c..d42fd4f578b2 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -535,9 +535,8 @@ struct cfs_rq {
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ #endif /* CONFIG_SMP */
+ 
+-#ifdef CONFIG_FAIR_GROUP_SCHED
+ 	struct rq		*rq;	/* CPU runqueue to which this cfs_rq is attached */
+-
++#ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/*
+ 	 * leaf cfs_rqs are those that hold tasks (lowest schedulable entity in
+ 	 * a hierarchy). Non-leaf lrqs hold other higher schedulable entities
+@@ -564,6 +563,11 @@ struct cfs_rq {
+ 	struct list_head	throttled_list;
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
++
++#ifdef CONFIG_BLD
++	struct list_head bld_cfs_list;
++	char pos;
++#endif
+ };
+ 
+ static inline int rt_bandwidth_enabled(void)
+@@ -603,12 +607,15 @@ struct rt_rq {
+ 	/* Nests inside the rq lock: */
+ 	raw_spinlock_t		rt_runtime_lock;
+ 
++	struct rq		*rq;
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 	unsigned long		rt_nr_boosted;
+-
+-	struct rq		*rq;
+ 	struct task_group	*tg;
+ #endif
++#ifdef CONFIG_BLD
++	struct list_head bld_rt_list;
++	int lowbit;
++#endif
+ };
+ 
+ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
+@@ -902,7 +909,7 @@ static inline int cpu_of(struct rq *rq)
+ }
+ 
+ 
+-#ifdef CONFIG_SCHED_SMT
++#if (defined CONFIG_SCHED_SMT) && (!defined CONFIG_BLD)
+ 
+ extern struct static_key_false sched_smt_present;
+ 
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 5b33e2f5c0ed..b45fa32df41b 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -943,7 +943,9 @@ static void __tick_nohz_idle_stop_tick(struct tick_sched *ts)
+ 
+ 		if (!was_stopped && ts->tick_stopped) {
+ 			ts->idle_jiffies = ts->last_jiffies;
++#ifndef	CONFIG_BLD
+ 			nohz_balance_enter_idle(cpu);
++#endif
+ 		}
+ 	} else {
+ 		tick_nohz_retain_tick(ts);
